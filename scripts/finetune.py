@@ -26,10 +26,9 @@ def parse_arguments():
     parser.add_argument("--savefreq", type=int, default=500)
     parser.add_argument("--logfreq", type=int, default=10)
     parser.add_argument("--evalfreq", type=int, default=100)
-    parser.add_argument("--logpath", type=str)
     args = parser.parse_args()
 
-    return (args.input, args.model, args.output, args.step, args.bs, args.cores, args.savefreq, args.logfreq, args.evalfreq, args.logpath)
+    return (args.input, args.model, args.output, args.step, args.bs, args.cores, args.savefreq, args.logfreq, args.evalfreq)
 
 
 def load_data(train_dataset: str, test_dataset: str, batch_size: int, num_workers: int):
@@ -90,14 +89,10 @@ def finetune(tokenizer: MethylVocab,
 def main():
     # Parse input parameters
     (input_dir, pre_model, out_dir, n_steps, batch_size, 
-     n_cores, savefreq, logfreq, evalfreq, log_path) = parse_arguments()
+     n_cores, savefreq, logfreq, evalfreq) = parse_arguments()
 
     # Create output directories
-    out_finetune = os.path.join(out_dir, "1.finetune")
-    out_plot = os.path.join(out_dir, "2.plot")
     if not os.path.exists(out_dir): os.mkdir(out_dir)
-    if not os.path.exists(out_finetune): os.mkdir(out_finetune)
-    if not os.path.exists(out_plot): os.mkdir(out_plot)
 
     # Prepare data loader
     tokenizer, train_data_loader, test_data_loader = \
@@ -108,7 +103,7 @@ def main():
 
     # Finetune the model
     finetune(tokenizer, 
-             out_finetune, 
+             out_dir, 
              train_data_loader, 
              test_data_loader, 
              pre_model, 

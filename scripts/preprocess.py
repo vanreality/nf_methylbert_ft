@@ -80,17 +80,16 @@ def parse_arguments():
     parser.add_argument("--val", type=str, help="Validation data file path", default=None)
     parser.add_argument("--test", type=str, help="Test data file path", default=None)
     parser.add_argument("--dmr", type=str, help="DMR file path")
-    parser.add_argument("--output", type=str, help="Output directory")
     parser.add_argument("--target", type=str, help="Target label", default="T")
     parser.add_argument("--background", type=str, help="Background label", default="N")
     args = parser.parse_args()
 
-    return (args.train, args.val, args.test, args.dmr, args.output, args.target, args.background)
+    return (args.train, args.val, args.test, args.dmr, args.target, args.background)
 
 
 def main():
     # Parse input parameters
-    (train_file, val_file, test_file, dmr_file, output_dir, target_label, background_label) = parse_arguments()
+    (train_file, val_file, test_file, dmr_file, target_label, background_label) = parse_arguments()
 
     # Methylbert data format
     methylbert_header = [
@@ -109,17 +108,17 @@ def main():
     if train_file:
         raw_train_data = pd.read_csv(train_file, sep='\t', names=['chr', 'start', 'end', 'seq', 'name', 'ctype'])
         converted_train_data = convert_to_methylbert_format(raw_train_data, dmr_df, methylbert_format, target_label, background_label)
-        converted_train_data.to_csv(os.path.join(output_dir, 'train_seq.csv'), sep='\t', header=True, index=None)
+        converted_train_data.to_csv('train_seq.csv', sep='\t', header=True, index=None)
     
     if val_file:
         raw_val_data = pd.read_csv(val_file, sep='\t', names=['chr', 'start', 'end', 'seq', 'name', 'ctype'])
         converted_train_data = convert_to_methylbert_format(raw_val_data, dmr_df, methylbert_format, target_label, background_label)
-        converted_train_data.to_csv(os.path.join(output_dir, 'val_seq.csv'), sep='\t', header=True, index=None)
+        converted_train_data.to_csv('val_seq.csv', sep='\t', header=True, index=None)
         
     if test_file:
         raw_test_data = pd.read_csv(test_file, sep='\t', names=['chr', 'start', 'end', 'seq', 'name', 'ctype'])
         converted_test_data = convert_to_methylbert_format(raw_test_data, dmr_df, methylbert_format, target_label, background_label)
-        converted_test_data.to_csv(os.path.join(output_dir, 'test_seq.csv'), sep='\t', header=True, index=None)
+        converted_test_data.to_csv('test_seq.csv', sep='\t', header=True, index=None)
 
 
 if __name__ == "__main__":

@@ -102,6 +102,7 @@ process methylbert_deconvolution {
 //}
 
 workflow {
+    // TODO Refine the workflow with a process for meta_param_parsing, add error handling
     Channel
         .fromPath(params.meta)
         .splitCsv(header: true, sep: '\t')

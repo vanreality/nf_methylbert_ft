@@ -19,7 +19,7 @@ curl -s https://get.nextflow.io | bash
 ## Pipeline Structure
 ```
 .                                   # Project root directory
-├── config                          # Directory for configuration files
+├── assets                          # Directory for assets files
 │   └── meta.tsv                    # Metadata table, describing sample information and file paths
 ├── data                            # Data directory, containing pretrained models and test data
 │   ├── pretrained_hg19_12l         # Pretrained model (hg19 version, 12 layers)
@@ -65,11 +65,15 @@ chr    start    end    seq    tag    label
 Place the prepared data files in the appropriate directory for processing.
 
 ### 2. Prepare Metadata File
-Edit the `config/meta.tsv` file to include the datasets and parameters required for each run.
+Create a meta.tsv file according to the format specified in `assets/meta.tsv`, including the necessary datasets and parameters for each run.
 
 ### 3. Execute the Pipeline
 ```bash
-nextflow run main.nf -profile singularity -bg
+nextflow run main.nf \
+    -profile singularity \
+    --input meta.tsv \
+    --outdir <OUTDIR> \
+    -bg 
 ```
 
 ## Cleaning Up Temporary Files

@@ -115,13 +115,13 @@ workflow {
                   row.target,
                   row.background)
         }
-        .set { meta_rows_ch }
+        .set { ch_meta_rows }
 
-    data_preprocess(meta_rows_ch)
-        | set { preprocessed_data_ch }
+    data_preprocess(ch_meta_rows)
+        | set { ch_preprocessed_data }
 
-    methylbert_finetune(preprocessed_data_ch)
-        | set { finetune_output_ch }
+    methylbert_finetune(ch_preprocessed_data)
+        | set { ch_finetune_output }
 
-    methylbert_deconvolution(finetune_output_ch)
+    methylbert_deconvolution(ch_finetune_output)
 }

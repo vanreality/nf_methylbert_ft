@@ -1,0 +1,2 @@
+train	validation	test	dmr	target	background
+/lustre1/cqyi/syfan/nf_methylbert_ft/data/test_data/data_2/train.bed	/lustre1/cqyi/syfan/nf_methylbert_ft/data/test_data/data_2/val.bed	/lustre1/cqyi/syfan/nf_methylbert_ft/data/test_data/data_2/test.bed	/lustre1/cqyi/syfan/nf_methylbert_ft/data/test_data/data_2/dmr.bed	T	N

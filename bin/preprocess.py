@@ -1,162 +1,205 @@
 #!/usr/bin/env python3
-import pandas as pd
-from intervaltree import Interval, IntervalTree
-import os
+"""Fine-tune preprocessing (Polars / streaming, no pandas iterrows / intervaltree).
+
+Reads train/val/test BED reads + a DMR BED, then:
+
+1. assigns each read its overlapping DMR (vectorised searchsorted, no per-row
+   Python loops over a tree);
+2. keeps only DMRs that are present in *all* provided splits and re-indexes the
+   ``dmr_label`` sequentially (identical semantics to the previous pandas code);
+3. converts each kept read to MethylBERT k-mer / methylation strings;
+4. writes one parquet per split (``*_seq.parquet``) plus ``filtered_dmr.bed``
+   (chr, start, end, dmr_label) so the infer pipeline can reuse the exact same
+   DMR index.
+"""
+
 import argparse
+import os
+
+import numpy as np
+import polars as pl
+
+BED_COLS = ["chr", "start", "end", "seq", "name", "ctype"]
 
 
-def build_interval_tree(dmr_df):
-    trees = {}
-    for chrom, group in dmr_df.groupby('chr'):
-        tree = IntervalTree()
-        for _, row in group.iterrows():
-            tree[row['start']:row['end']] = row['dmr_label']
-        trees[chrom] = tree
-    return trees
+def read_bed(path: str) -> pl.DataFrame:
+    """Stream a 6-column BED-like reads file with Polars."""
+    return (
+        pl.scan_csv(
+            path,
+            separator="\t",
+            has_header=False,
+            new_columns=BED_COLS,
+            schema_overrides={"chr": pl.Utf8, "start": pl.Int64, "end": pl.Int64,
+                              "seq": pl.Utf8, "name": pl.Utf8, "ctype": pl.Utf8},
+        )
+        .collect(streaming=True)
+    )
 
 
-def get_overlapping_dmr_labels(dmr_trees, data_df):
-    """Return the set of dmr_labels that overlap with at least one read in data_df."""
-    labels = set()
-    for _, row in data_df.iterrows():
-        chrom = row['chr']
-        if chrom in dmr_trees:
-            for ov in dmr_trees[chrom].overlap(row['start'], row['end']):
-                labels.add(ov.data)
-    return labels
+def read_dmr(path: str) -> pl.DataFrame:
+    dmr = pl.read_csv(
+        path, separator="\t", has_header=False,
+        columns=[0, 1, 2], new_columns=["chr", "start", "end"],
+        schema_overrides={"chr": pl.Utf8, "start": pl.Int64, "end": pl.Int64},
+    )
+    return dmr.with_row_index("dmr_label").select(
+        ["chr", "start", "end", pl.col("dmr_label").cast(pl.Int64)]
+    )
 
 
-def filter_dmr_by_overlap(dmr_df, data_dfs):
-    """Keep only DMRs that overlap with reads in ALL splits, then reassign sequential dmr_label."""
-    dmr_trees = build_interval_tree(dmr_df)
-
-    per_split_labels = [get_overlapping_dmr_labels(dmr_trees, df) for df in data_dfs]
-    common_labels = set.intersection(*per_split_labels)
-
-    filtered = dmr_df[dmr_df['dmr_label'].isin(common_labels)].reset_index(drop=True)
-    filtered['dmr_label'] = range(filtered.shape[0])
-    print(f"DMR filtering: {dmr_df.shape[0]} -> {filtered.shape[0]} (dropped {dmr_df.shape[0] - filtered.shape[0]} DMRs not present in all splits)")
-    return filtered
-
-
-def filter_sequences_by_dmr(data_df, dmr_df):
-    """Keep only reads that overlap with at least one retained DMR."""
-    dmr_trees = build_interval_tree(dmr_df)
-    keep = []
-    for idx, row in data_df.iterrows():
-        chrom = row['chr']
-        if chrom in dmr_trees and dmr_trees[chrom].overlap(row['start'], row['end']):
-            keep.append(idx)
-    filtered = data_df.loc[keep].reset_index(drop=True)
-    print(f"Sequence filtering: {data_df.shape[0]} -> {filtered.shape[0]} reads")
-    return filtered
+def build_dmr_index(dmr_df: pl.DataFrame):
+    """Per-chromosome arrays sorted by start (DMRs are non-overlapping regions)."""
+    index = {}
+    for chrom, sub in dmr_df.partition_by("chr", as_dict=True).items():
+        chrom = chrom[0] if isinstance(chrom, tuple) else chrom
+        sub = sub.sort("start")
+        index[chrom] = (
+            sub["start"].to_numpy(),
+            sub["end"].to_numpy(),
+            sub["dmr_label"].to_numpy(),
+        )
+    return index
 
 
-def assign_dmr_label(data_df, dmr_df):
-    dmr_tree = build_interval_tree(dmr_df)
+def assign_overlapping_label(reads_df: pl.DataFrame, dmr_index) -> np.ndarray:
+    """Return the overlapping (original) dmr_label per read, or -1 if none."""
+    n = reads_df.height
+    out = np.full(n, -1, dtype=np.int64)
+    chrom_np = reads_df["chr"].to_numpy()
+    start_np = reads_df["start"].to_numpy()
+    end_np = reads_df["end"].to_numpy()
 
-    for idx, row in data_df.iterrows():
-        if row['chr'] in dmr_tree:
-            overlaps = dmr_tree[row['chr']].overlap(row['start'], row['end'])
-            count = len(overlaps)
-            if count == 1:
-                data_df.at[idx, 'dmr_label'] = list(overlaps)[0].data
-            elif count > 1:
-                print(f'{row} overlaps with multiple dmrs')
-                data_df.at[idx, 'dmr_label'] = list(overlaps)[0].data
-
-    data_df['dmr_label'] = data_df['dmr_label'].astype(int)
-    return data_df
-
-
-def seq_to_kmer(seq, k=3):
-    converted_seq = list()
-    methyl_seq = list()
-    for seq_idx in range(len(seq)-k):
-        token = seq[seq_idx:seq_idx+k]
-        if token[1] == 'C':
-            m = 0
-        elif token[1] == 'M':
-            m = 1
-        else:
-            m = 2
-            
-        converted_seq.append(token)
-        methyl_seq.append(str(m))
-
-    return " ".join(converted_seq), "".join(methyl_seq)
+    for chrom in np.unique(chrom_np):
+        if chrom not in dmr_index:
+            continue
+        d_start, d_end, d_label = dmr_index[chrom]
+        sel = np.nonzero(chrom_np == chrom)[0]
+        rs = start_np[sel]
+        re = end_np[sel]
+        pos = np.searchsorted(d_start, rs, side="right") - 1
+        assigned = np.full(sel.shape[0], -1, dtype=np.int64)
+        # Check a small neighbourhood; DMRs are non-overlapping so a read can
+        # only touch the interval starting at/just before it (and the next one).
+        for c in (-1, 0, 1):
+            idx = pos + c
+            valid = (idx >= 0) & (idx < d_start.shape[0]) & (assigned < 0)
+            if not valid.any():
+                continue
+            vi = np.nonzero(valid)[0]
+            di = idx[vi]
+            overlap = (d_start[di] < re[vi]) & (d_end[di] > rs[vi])
+            hit = vi[overlap]
+            assigned[hit] = d_label[di[overlap]]
+        out[sel] = assigned
+    return out
 
 
-def convert_to_methylbert_format(data_df, dmr_df, format_df, target_label, background_label):
-    data_df = assign_dmr_label(data_df, dmr_df)
-    data_df[['dna_seq', 'methyl_seq']] = data_df['seq'].apply(lambda x: pd.Series(seq_to_kmer(x, k=3)))
-    data_df = data_df.rename(columns={"chr":"ref_name", 
-                                      "start":"ref_pos", 
-                                      "end":"length"})
-    data_df['length'] = data_df['length'] - data_df['ref_pos']
-    data_df['ctype'] = data_df['ctype'].replace({target_label: 'T', background_label: 'N'})
-    data_df['dmr_ctype'] = 'T'
-
-    # Ensure data_df has all columns from format_df
-    missing_columns = set(format_df.columns) - set(data_df.columns)
-    
-    # Add missing columns to data_df with values filled as '='
-    for col in missing_columns:
-        data_df[col] = '='
-
-    data_df = data_df[format_df.columns]
-        
-    return data_df
+def seq_to_kmer(seq: str, k: int = 3):
+    converted, methyl = [], []
+    for i in range(len(seq) - k):
+        token = seq[i:i + k]
+        mid = token[1]
+        m = 0 if mid == "C" else (1 if mid == "M" else 2)
+        converted.append(token)
+        methyl.append(str(m))
+    return " ".join(converted), "".join(methyl)
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train", type=str, help="Training data file path", default=None)
-    parser.add_argument("--val", type=str, help="Validation data file path", default=None)
-    parser.add_argument("--test", type=str, help="Test data file path", default=None)
-    parser.add_argument("--dmr", type=str, help="DMR file path")
-    parser.add_argument("--target", type=str, help="Target label", default="T")
-    parser.add_argument("--background", type=str, help="Background label", default="N")
-    args = parser.parse_args()
+def kmerize(seqs):
+    dna, methyl = [], []
+    for s in seqs:
+        a, b = seq_to_kmer(s)
+        dna.append(a)
+        methyl.append(b)
+    return dna, methyl
 
-    return (args.train, args.val, args.test, args.dmr, args.target, args.background)
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--train", default=None)
+    p.add_argument("--val", default=None)
+    p.add_argument("--test", default=None)
+    p.add_argument("--dmr", required=True)
+    p.add_argument("--target", default="T")
+    p.add_argument("--background", default="N")
+    p.add_argument("--outdir", default=".")
+    return p.parse_args()
 
 
 def main():
-    # Parse input parameters
-    (train_file, val_file, test_file, dmr_file, target_label, background_label) = parse_arguments()
+    args = parse_args()
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # Methylbert data format
-    methylbert_header = [
-        'name', 'flag', 'ref_name', 'ref_pos', 'map_quality',
-        'cigar', 'next_ref_name', 'next_ref_pos', 'length', 'seq',
-        'qual', 'MD', 'PG', 'XG', 'NM', 'XM', 'XR',
-        'dna_seq', 'methyl_seq', 'dmr_ctype', 'dmr_label', 'ctype'
-    ]
-    methylbert_format = pd.DataFrame(columns=methylbert_header)
-    
-    # DMR
-    dmr_df = pd.read_csv(dmr_file, sep='\t', usecols=[0, 1, 2], names=['chr', 'start', 'end'])
-    dmr_df['dmr_label'] = range(dmr_df.shape[0])
+    dmr_df = read_dmr(args.dmr)
+    dmr_index = build_dmr_index(dmr_df)
 
-    bed_cols = ['chr', 'start', 'end', 'seq', 'name', 'ctype']
-    data = {}
-    if train_file:
-        data['train'] = pd.read_csv(train_file, sep='\t', names=bed_cols)
-    if val_file:
-        data['val'] = pd.read_csv(val_file, sep='\t', names=bed_cols)
-    if test_file:
-        data['test'] = pd.read_csv(test_file, sep='\t', names=bed_cols)
+    splits = {}
+    for split, path in [("train", args.train), ("val", args.val), ("test", args.test)]:
+        if path:
+            splits[split] = read_bed(path)
 
-    dmr_df = filter_dmr_by_overlap(dmr_df, list(data.values()))
+    # Per-split overlapping labels, then DMRs common to ALL splits.
+    split_labels = {}
+    per_split_present = []
+    for split, df in splits.items():
+        lab = assign_overlapping_label(df, dmr_index)
+        split_labels[split] = lab
+        per_split_present.append(set(int(x) for x in np.unique(lab) if x >= 0))
 
-    for split, output_name in [('train', 'train_seq.csv'), ('val', 'val_seq.csv'), ('test', 'test_seq.csv')]:
-        if split in data:
-            data[split] = filter_sequences_by_dmr(data[split], dmr_df)
-            converted = convert_to_methylbert_format(data[split], dmr_df, methylbert_format, target_label, background_label)
-            converted.to_csv(output_name, sep='\t', header=True, index=None)
+    common = set.intersection(*per_split_present) if per_split_present else set()
+    kept = dmr_df.filter(pl.col("dmr_label").is_in(sorted(common))).sort(["chr", "start"])
+    remap = {old: new for new, old in enumerate(kept["dmr_label"].to_list())}
+    print(f"DMR filtering: {dmr_df.height} -> {kept.height} "
+          f"(dropped {dmr_df.height - kept.height} not present in all splits)")
+
+    # Save the filtered DMR index (shared with the infer pipeline).
+    filtered_path = os.path.join(args.outdir, "filtered_dmr.bed")
+    (
+        kept.with_columns(
+            pl.col("dmr_label").replace_strict(remap, default=None).alias("dmr_label")
+        )
+        .select(["chr", "start", "end", "dmr_label"])
+        .write_csv(filtered_path, separator="\t", include_header=False)
+    )
+
+    target, background = args.target, args.background
+    for split, out_name in [("train", "train_seq.parquet"),
+                            ("val", "val_seq.parquet"),
+                            ("test", "test_seq.parquet")]:
+        if split not in splits:
+            continue
+        df = splits[split]
+        labels = split_labels[split]
+        new_labels = np.array([remap.get(int(x), -1) for x in labels], dtype=np.int64)
+        keep_mask = new_labels >= 0
+
+        df = df.with_columns(pl.Series("dmr_label", new_labels)).filter(
+            pl.Series(keep_mask)
+        )
+        print(f"{split}: {labels.shape[0]} -> {df.height} reads after DMR overlap filter")
+
+        dna, methyl = kmerize(df["seq"].to_list())
+        ctype_norm = (
+            df["ctype"]
+            .map_elements(
+                lambda c: "T" if c == target else ("N" if c == background else c),
+                return_dtype=pl.Utf8,
+            )
+        )
+        out = pl.DataFrame({
+            "name": df["name"],
+            "dna_seq": dna,
+            "methyl_seq": methyl,
+            "dmr_label": df["dmr_label"],
+            "ctype": ctype_norm,
+            "dmr_ctype": pl.Series(["T"] * df.height),
+        }).with_columns(
+            (pl.col("ctype") == "T").cast(pl.Int8).alias("ctype_label")
+        )
+        out.write_parquet(os.path.join(args.outdir, out_name), compression="zstd")
+        print(f"Wrote {out.height} reads -> {out_name}")
 
 
 if __name__ == "__main__":
     main()
-

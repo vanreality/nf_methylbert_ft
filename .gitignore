@@ -3,3 +3,8 @@ results/
 work/
 data/
 images/
+.cursor*
+__pycache__*
+test/
+run_main.slurm
+run.log
